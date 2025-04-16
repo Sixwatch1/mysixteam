@@ -1,0 +1,1530 @@
+# File: main.py
+from flask import Flask
+from flask_socketio import SocketIO
+from routes.routes import routes
+from routes.got_your_six import got_your_six
+from models.models import db
+from flask_bcrypt import Bcrypt
+import os
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///site.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'your-secret-key')
+db.init_app(app)
+bcrypt = Bcrypt(app)
+socketio = SocketIO(app)
+
+app.register_blueprint(routes)
+app.register_blueprint(got_your_six)
+
+with app.app_context():
+    db.create_all()
+
+@socketio.on('send_message')
+def handle_message(data):
+    room = data['room']
+    message = data['message']
+    username = data['username']
+    socketio.emit('receive_message', {'username': username, 'message': message}, to=room)
+
+if __name__ == '__main__':
+    socketio.run(app, debug=True)
+
+# File: requirements.txt
+Flask==2.0.1
+Flask-SQLAlchemy==2.5.1
+Flask-Bcrypt==0.7.1
+requests==2.26.0
+gunicorn==20.1.0
+Flask-SocketIO==5.3.2
+
+# File: env_secrets.yaml
+FLASK_SECRET_KEY: your-secret-key
+TWILIO_ACCOUNT_SID: your-twilio-sid
+TWILIO_AUTH_TOKEN: your-twilio-token
+TWILIO_PHONE_NUMBER: your-twilio-number
+GOOGLE_MAPS_API_KEY: your-google-maps-key
+
+# File: models/models.py
+from datetime import datetime
+from flask_sqlalchemy import SQLAlchemy
+from flask_bcrypt import Bcrypt
+
+db = SQLAlchemy()
+bcrypt = Bcrypt()
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password = db.Column(db.String(60), nullable=False)
+    userType = db.Column(db.String(50), nullable=False)
+    fullName = db.Column(db.String(100))
+    subscribed = db.Column(db.Boolean, default=True)
+    createdAt = db.Column(db.DateTime, default=datetime.utcnow)
+    is_admin = db.Column(db.Boolean, default=False)
+    profile_picture_id = db.Column(db.String(100))
+    professional_credentials = db.Column(db.String(200))
+    professional_license_number = db.Column(db.String(100))
+    professional_verification_status = db.Column(db.Boolean, default=False)
+    chatter_profile = db.relationship('ChatterProfile', backref='user', uselist=False)
+    subscriptions = db.relationship('Subscription', backref='user', lazy=True)
+
+class ChatterProfile(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    chatter_username = db.Column(db.String(50), unique=True, nullable=False)
+    chatter_about_me = db.Column(db.Text)
+    chatter_zip_code = db.Column(db.String(10))
+    createdAt = db.Column(db.DateTime, default=datetime.utcnow)
+
+class ChatterAKAHistory(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    old_username = db.Column(db.String(50), nullable=False)
+    changed_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class ChatRoom(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    type = db.Column(db.String(20), nullable=False)
+    creator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    createdAt = db.Column(db.DateTime, default=datetime.utcnow)
+    moderators = db.relationship('Moderator', backref='chatroom')
+
+class Moderator(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    room_id = db.Column(db.Integer, db.ForeignKey('chat_room.id'), nullable=False)
+    assigned_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Subscription(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    tier = db.Column(db.String(50), nullable=False)
+    start_date = db.Column(db.DateTime, default=datetime.utcnow)
+    expiration_date = db.Column(db.DateTime, nullable=False)
+    is_active = db.Column(db.Boolean, default=True)
+    features = db.Column(db.Text)
+
+class CrisisResource(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(100), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+
+class MapPoint(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.Text, nullable=False)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    approved = db.Column(db.Boolean, default=False)
+
+# File: models/got_your_six.py
+from flask_sqlalchemy import SQLAlchemy
+
+db = SQLAlchemy()
+
+class GotYourSixRequest(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    request_type = db.Column(db.String(50), nullable=False)
+    urgency_level = db.Column(db.String(20))
+    description = db.Column(db.Text)
+    location = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+# File: routes/routes.py
+from flask import Blueprint, render_template, request, session, redirect, url_for, jsonify, flash
+from models.models import db, User, ChatterProfile, ChatterAKAHistory, ChatRoom, Moderator, CrisisResource, MapPoint
+from flask_bcrypt import check_password_hash, generate_password_hash
+import requests
+import os
+
+routes = Blueprint('routes', __name__)
+
+def login_required(f):
+    def wrap(*args, **kwargs):
+        if not session.get('user'):
+            return redirect(url_for('routes.login'))
+        return f(*args, **kwargs)
+    wrap.__name__ = f.__name__
+    return wrap
+
+@routes.route('/')
+def home():
+    crisis_resources = CrisisResource.query.first()
+    local_crisis_resources = []  # Implement geolocation-based query later
+    return render_template('home.html', crisis_resources=crisis_resources, local_crisis_resources=local_crisis_resources)
+
+@routes.route('/support-network')
+@login_required
+def support_network():
+    return render_template('support_network.html')
+
+@routes.route('/crisis-resources')
+def crisis_resources():
+    crisis_resources = CrisisResource.query.first()
+    local_resources = []  # Implement geolocation-based query later
+    return render_template('crisis_resources.html', crisis_resources=crisis_resources, local_resources=local_resources)
+
+@routes.route('/ptsd-info')
+@login_required
+def ptsd_info():
+    return render_template('ptsd_info.html')
+
+@routes.route('/about')
+def about():
+    return render_template('about.html')
+
+@routes.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        user = User.query.filter_by(email=email).first()
+        if user and check_password_hash(user.password, password):
+            session['user'] = {
+                'id': user.id,
+                'email': user.email,
+                'is_admin': user.is_admin,
+                'userType': user.userType,
+                'fullName': user.fullName,
+                'profile_picture_id': user.profile_picture_id
+            }
+            flash('Logged in successfully!', 'success')
+            return redirect(url_for('routes.dashboard'))
+        flash('Invalid credentials', 'danger')
+    return render_template('login.html')
+
+@routes.route('/register', methods=['POST'])
+def register():
+    email = request.form['email']
+    password = request.form['password']
+    confirm_password = request.form['confirm_password']
+    if password != confirm_password:
+        flash('Passwords do not match', 'danger')
+        return redirect(url_for('routes.login'))
+    if User.query.filter_by(email=email).first():
+        flash('Email already registered', 'danger')
+        return redirect(url_for('routes.login'))
+    user = User(
+        email=email,
+        password=generate_password_hash(password),
+        userType='browsing'
+    )
+    db.session.add(user)
+    db.session.commit()
+    flash('Registered successfully! Please log in.', 'success')
+    return redirect(url_for('routes.login'))
+
+@routes.route('/logout', methods=['POST'])
+@login_required
+def logout():
+    session.pop('user', None)
+    flash('Logged out successfully', 'success')
+    return redirect(url_for('routes.home'))
+
+@routes.route('/profile', methods=['GET', 'POST'])
+@login_required
+def profile():
+    user = User.query.get(session['user']['id'])
+    if request.method == 'POST':
+        user.userType = request.form.get('userType')
+        user.chatter_profile.chatter_zip_code = request.form.get('zip_code')
+        if user.userType == 'medical_professional':
+            user.professional_credentials = request.form.get('professional_credentials')
+            user.professional_license_number = request.form.get('professional_license_number')
+        db.session.commit()
+        session['user'].update({
+            'userType': user.userType
+        })
+        flash('Profile updated successfully', 'success')
+    return render_template('profile.html')
+
+@routes.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'POST':
+        email = request.form['email']
+        user = User.query.filter_by(email=email).first()
+        if user:
+            flash('Password reset instructions sent to your email', 'success')
+        else:
+            flash('Email not found', 'danger')
+    return render_template('forgot_password.html')
+
+@routes.route('/reset-password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    if request.method == 'POST':
+        password = request.form['password']
+        confirm_password = request.form['confirm_password']
+        if password != confirm_password:
+            flash('Passwords do not match', 'danger')
+            return redirect(url_for('routes.reset_password', token=token))
+        flash('Password reset successfully', 'success')
+        return redirect(url_for('routes.login'))
+    return render_template('reset_password.html', token=token)
+
+@routes.route('/dashboard')
+@login_required
+def dashboard():
+    return render_template('dashboard.html')
+
+@routes.route('/admin', methods=['GET', 'POST'])
+@login_required
+def admin():
+    if not session['user']['is_admin']:
+        flash('Access denied', 'danger')
+        return redirect(url_for('routes.home'))
+    users = User.query.all()
+    crisis_resources = CrisisResource.query.first()
+    map_points = MapPoint.query.all()
+    if request.method == 'POST':
+        if 'crisis_hotlines' in request.form:
+            if crisis_resources:
+                crisis_resources.title = request.form['crisis_title']
+                crisis_resources.content = request.form['crisis_hotlines']
+            else:
+                crisis_resources = CrisisResource(
+                    title=request.form['crisis_title'],
+                    content=request.form['crisis_hotlines']
+                )
+                db.session.add(crisis_resources)
+            db.session.commit()
+            flash('Crisis resources updated', 'success')
+    return render_template('admin.html', users=users, crisis_resources=crisis_resources, map_points=map_points)
+
+@routes.route('/admin/create-user', methods=['POST'])
+@login_required
+def admin_create_user():
+    if not session['user']['is_admin']:
+        flash('Access denied', 'danger')
+        return redirect(url_for('routes.home'))
+    email = request.form['email']
+    password = request.form['password']
+    userType = request.form['userType']
+    is_admin = 'is_admin' in request.form
+    if User.query.filter_by(email=email).first():
+        flash('Email already exists', 'danger')
+        return redirect(url_for('routes.admin'))
+    user = User(
+        email=email,
+        password=generate_password_hash(password),
+        userType=userType,
+        is_admin=is_admin
+    )
+    db.session.add(user)
+    db.session.commit()
+    flash('User created successfully', 'success')
+    return redirect(url_for('routes.admin'))
+
+@routes.route('/site-config')
+@login_required
+def site_config():
+    if not session['user']['is_admin']:
+        flash('Access denied', 'danger')
+        return redirect(url_for('routes.home'))
+    return render_template('admin_site_config.html')
+
+@routes.route('/api/chatters')
+@login_required
+def get_chatters():
+    chatters = ChatterProfile.query.join(User).all()
+    return jsonify([{
+        'chatter_username': c.chatter_username,
+        'chatter_about_me': c.chatter_about_me,
+        'akas': [aka.old_username for aka in ChatterAKAHistory.query.filter_by(user_id=c.user_id).all()],
+        'userType': c.user.userType
+    } for c in chatters])
+
+@routes.route('/api/chatrooms')
+@login_required
+def get_chatrooms():
+    rooms = ChatRoom.query.all()
+    return jsonify([{
+        'id': r.id,
+        'name': r.name,
+        'type': r.type,
+        'moderators': [User.query.get(m.user_id).chatter_profile.chatter_username for m in r.moderators]
+    } for r in rooms])
+
+@routes.route('/api/profile/user', methods=['POST'])
+@login_required
+def update_user_profile():
+    user = User.query.get(session['user']['id'])
+    user.fullName = request.form.get('fullName')
+    user.userType = request.form.get('userType')
+    db.session.commit()
+    return jsonify({'message': 'User profile updated'})
+
+@routes.route('/api/profile/chatter', methods=['POST'])
+@login_required
+def update_chatter_profile():
+    profile = ChatterProfile.query.filter_by(user_id=session['user']['id']).first()
+    new_username = request.form.get('chatter_username')
+    if new_username != profile.chatter_username:
+        aka = ChatterAKAHistory(user_id=profile.user_id, old_username=profile.chatter_username)
+        db.session.add(aka)
+    profile.chatter_username = new_username
+    profile.chatter_about_me = request.form.get('chatter_about_me')
+    profile.chatter_zip_code = request.form.get('zip_code')
+    db.session.commit()
+    return jsonify({'message': 'Chatter profile updated'})
+
+@routes.route('/api/newsletters/subscribe', methods=['POST'])
+@login_required
+def subscribe_newsletter():
+    user = User.query.get(session['user']['id'])
+    user.subscribed = 'subscribed' in request.form
+    db.session.commit()
+    return jsonify({'message': 'Subscription updated'})
+
+@routes.route('/api/newsletters/send', methods=['POST'])
+@login_required
+def send_newsletter():
+    if not session['user']['is_admin']:
+        return jsonify({'error': 'Unauthorized'}), 401
+    target = request.form.get('targetGroup')
+    template = request.form.get('template')
+    return jsonify({'message': 'Newsletter sent'})
+
+@routes.route('/api/chatrooms/create', methods=['POST'])
+@login_required
+def create_chatroom():
+    room = ChatRoom(
+        name=request.form.get('roomName'),
+        type=request.form.get('roomType'),
+        creator_id=session['user']['id']
+    )
+    db.session.add(room)
+    db.session.commit()
+    return jsonify({'message': 'Room created'})
+
+@routes.route('/api/chatrooms/assign-mod', methods=['POST'])
+@login_required
+def assign_moderator():
+    data = request.get_json()
+    room = ChatRoom.query.get(data['roomId'])
+    user = User.query.join(ChatterProfile).filter(ChatterProfile.chatter_username == data['username']).first()
+    if not user or not room:
+        return jsonify({'error': 'Invalid user or room'}), 400
+    mod = Moderator(user_id=user.id, room_id=room.id)
+    db.session.add(mod)
+    db.session.commit()
+    return jsonify({'message': 'Moderator assigned'})
+
+@routes.route('/api/suggest-resource', methods=['POST'])
+@login_required
+def suggest_resource():
+    name = request.form.get('name')
+    description = request.form.get('description')
+    latitude = request.form.get('latitude')
+    longitude = request.form.get('longitude')
+    map_point = MapPoint(
+        name=name,
+        description=description,
+        latitude=float(latitude),
+        longitude=float(longitude),
+        user_id=session['user']['id'],
+        approved=False
+    )
+    db.session.add(map_point)
+    db.session.commit()
+    return jsonify({'message': 'Resource suggested successfully'})
+
+@routes.route('/api/suggest-event', methods=['POST'])
+@login_required
+def suggest_event():
+    return jsonify({'message': 'Event suggestion not implemented yet'})
+
+@routes.route('/api/refresh-resources', methods=['GET'])
+@login_required
+def refresh_resources():
+    return jsonify({'message': 'Resources refreshed'})
+
+@routes.route('/get_profile_picture/<file_id>')
+@login_required
+def get_profile_picture(file_id):
+    return redirect(url_for('static', filename='default_avatar.png'))
+
+# File: routes/got_your_six.py
+from flask import Blueprint, request, jsonify, session
+from models.models import db
+from models.got_your_six import GotYourSixRequest
+from twilio.rest import Client
+import os
+
+got_your_six = Blueprint('got_your_six', __name__)
+
+client = Client(os.environ.get('TWILIO_ACCOUNT_SID'), os.environ.get('TWILIO_AUTH_TOKEN'))
+
+@got_your_six.route('/got-your-six/request', methods=['POST'])
+def got_your_six_request():
+    if not request.json or 'request_type' not in request.json:
+        return jsonify({'error': 'Missing request_type'}), 400
+    data = request.json
+    new_request = GotYourSixRequest(
+        user_id=session['user']['id'],
+        request_type=data['request_type'],
+        urgency_level=data.get('urgency_level'),
+        description=data.get('description'),
+        location=data.get('location')
+    )
+    db.session.add(new_request)
+    db.session.commit()
+    if data['request_type'] == 'call':
+        call = client.calls.create(
+            to='YOUR_ACTUAL_NUMBER',
+            from_=os.environ.get('TWILIO_PHONE_NUMBER'),
+            url='YOUR_TWIML_URL'
+        )
+        return jsonify({'success': True, 'message': 'Request created', 'call_sid': call.sid})
+    return jsonify({'success': True, 'message': 'Request created'})
+
+# File: templates/base.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}{% endblock %} - SIX</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="{{ url_for('static', filename='styles.css') }}" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #5b8c85;
+            --secondary-color: #a7c4bc;
+            --accent-color: #f2f9f1;
+            --text-color: #333;
+            --light-text: #6c757d;
+            --crisis-color: #b55a60;
+            --crisis-light: #f8e9e9;
+            --transition-speed: 0.3s;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: var(--text-color);
+            background-color: #f8f9fa;
+            background-image: linear-gradient(120deg, #f8f9fa 0%, var(--accent-color) 100%);
+            line-height: 1.6;
+            padding-top: 80px;
+        }
+        
+        .card {
+            border-radius: 15px;
+            border: none;
+            box-shadow: 0 5px 20px rgba(0, 0, 0, 0.03);
+            transition: transform var(--transition-speed), box-shadow var(--transition-speed);
+            margin-bottom: 1.5rem;
+        }
+        
+        .card:hover {
+            transform: translateY(-7px);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.08);
+        }
+        
+        .card-header {
+            background-color: var(--primary-color);
+            color: white;
+            font-weight: 600;
+            border-top-left-radius: 15px;
+            border-top-right-radius: 15px;
+        }
+        
+        h1, h2, h3 {
+            font-weight: 600;
+            color: var(--primary-color);
+        }
+        
+        .btn-primary {
+            background-color: var(--primary-color);
+            border-color: var(--primary-color);
+            border-radius: 30px;
+            padding: 0.6rem 2rem;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+            box-shadow: 0 4px 15px rgba(91, 140, 133, 0.2);
+            transition: all var(--transition-speed);
+        }
+        
+        .btn-primary:hover, .btn-primary:focus {
+            background-color: #4a7a74;
+            border-color: #4a7a74;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(91, 140, 133, 0.3);
+        }
+    </style>
+</head>
+<body>
+    {% include 'partials/header.html' %}
+    <div class="container">
+        {% block content %}{% endblock %}
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+
+# File: templates/partials/header.html
+<nav class="navbar navbar-expand-lg navbar-light fixed-top" style="background-color: #f8f9fa; background-image: linear-gradient(120deg, #f8f9fa 0%, #f2f9f1 100%); box-shadow: 0 4px 20px rgba(0,0,0,0.04);">
+    <div class="container-fluid" style="max-height: 80vh; overflow-y: auto;">
+        <a class="navbar-brand" href="/" style="font-weight: 600; color: #5b8c85; transition: color 0.3s ease;">SIX</a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#mainNavbar">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="mainNavbar">
+            <ul class="navbar-nav ms-auto mb-2 mb-lg-0">
+                <li class="nav-item">
+                    <a class="nav-link" href="/" style="color: #333; font-weight: 500; transition: color 0.3s ease;">Home</a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link" href="/crisis-resources" style="color: #333; font-weight: 500; transition: color 0.3s ease;">Crisis Resources</a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link" href="/ptsd-info" style="color: #333; font-weight: 500; transition: color 0.3s ease;">Understanding PTSD</a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link" href="/support-network" style="color: #333; font-weight: 500; transition: color 0.3s ease;">Support Network</a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link" href="/about" style="color: #333; font-weight: 500; transition: color 0.3s ease;">About SIX</a>
+                </li>
+                {% if session.user %}
+                    {% if session.user.is_admin and session.user.userType == 'admin' %}
+                    <li class="nav-item">
+                        <a class="nav-link" href="/admin" style="color: #333; font-weight: 500; transition: color 0.3s ease;">Admin</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/site-config" style="color: #333; font-weight: 500; transition: color 0.3s ease;">Site Config</a>
+                    </li>
+                    {% endif %}
+                    <li class="nav-item">
+                        <a class="nav-link" href="/profile" style="color: #333; font-weight: 500; transition: color 0.3s ease;">Profile</a>
+                    </li>
+                    <li class="nav-item">
+                        <form action="/logout" method="post" class="d-inline">
+                            <button type="submit" class="btn btn-link nav-link" onclick="return confirm('Are you sure you want to logout?')" style="color: #333; font-weight: 500; transition: color 0.3s ease;">
+                                Logout
+                            </button>
+                        </form>
+                    </li>
+                {% else %}
+                    <li class="nav-item">
+                        <a class="nav-link" href="/login" style="color: #333; font-weight: 500; transition: color 0.3s ease;">Login/Register</a>
+                    </li>
+                {% endif %}
+            </ul>
+        </div>
+    </div>
+</nav>
+
+# File: templates/home.html
+{% extends "base.html" %}
+{% block title %}Home{% endblock %}
+{% block content %}
+<div class="main-content">
+    <div class="container">
+        <div class="welcome-container text-center">
+            <img src="{{ url_for('static', filename='logo.png') }}" alt="SIX Logo" class="header-logo mb-5" onerror="this.style.display='none'" style="max-width: 132px; max-height: 132px;">
+            <h1 class="mb-4">Welcome to SIX</h1>
+            <p class="lead mx-auto" style="max-width: 800px;">A gentle space designed to support your healing journey. We're here to walk alongside you with understanding and compassion.</p>
+            {% if session.user and session.user.userType == 'survivor_of_ptsd' %}
+                <div class="alert alert-info mt-4">
+                    <p>As a survivor, you are not alone. Our community is here to support you with resources and connections.</p>
+                    <p>Need immediate help? Visit our <a href="{{ url_for('routes.crisis_resources') }}">Crisis Resources</a> page.</p>
+                </div>
+            {% endif %}
+            {% if not session.user %}
+                <div class="cta-buttons">
+                    <a href="{{ url_for('routes.login') }}" class="btn btn-primary btn-lg mb-3">Join Our Community</a>
+                    <p class="text-muted">Already a member? <a href="{{ url_for('routes.login') }}" class="text-decoration-none">Sign in</a></p>
+                </div>
+            {% endif %}
+        </div>
+        
+        <div class="breathing-guide">
+            <div class="breathing-circle">
+                <span>Breathe</span>
+            </div>
+            <p>Take a moment for yourself. Breathe in as the circle expands, out as it contracts.</p>
+        </div>
+        
+        <div class="features-section mt-5">
+            <div class="row">
+                <div class="col-md-4 mb-4">
+                    <a href="{{ url_for('routes.support_network') }}" class="text-decoration-none">
+                        <div class="feature-card">
+                            <div class="card-body text-center">
+                                <div class="feature-icon">
+                                    <img src="{{ url_for('static', filename='support_network_card_logo.png') }}" alt="Support Network" style="width: 97%; height: 97%;">
+                                </div>
+                                <h3 class="feature-title">Support Network</h3>
+                                <p class="feature-text">Connect with others who understand your experiences in a safe, moderated environment</p>
+                            </div>
+                        </div>
+                    </a>
+                </div>
+                <div class="col-md-4 mb-4">
+                    <a href="{{ url_for('routes.crisis_resources') }}" class="text-decoration-none">
+                        <div class="feature-card">
+                            <div class="card-body text-center">
+                                <div class="feature-icon">
+                                    <i class="fas fa-life-ring fa-2x"></i>
+                                </div>
+                                <h3 class="feature-title">Crisis Support</h3>
+                                <p class="feature-text">Immediate access to crisis resources and support hotlines</p>
+                            </div>
+                        </div>
+                    </a>
+                </div>
+                <div class="col-md-4 mb-4">
+                    <a href="{{ url_for('routes.ptsd_info') }}" class="text-decoration-none">
+                        <div class="feature-card">
+                            <div class="card-body text-center">
+                                <div class="feature-icon">
+                                    <i class="fas fa-brain fa-2x"></i>
+                                </div>
+                                <h3 class="feature-title">Growth Network</h3>
+                                <p class="feature-text">Understanding PTSD and Personal Growth Resources</p>
+                            </div>
+                        </div>
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <div class="divider"></div>
+        
+        <div class="testimonial">
+            <p>SIX: Facts on PTSD and a Step Toward Relief</p>
+            <p>Post-Traumatic Stress Disorder (PTSD) is a mental health condition that affects more than 8 million adults in the United States each year, according to data from the National Institute of Mental Health (Kessler et al., 2005).</p>
+            <div class="testimonial-author">- Research-Based Insights on PTSD</div>
+        </div>
+        
+        <div class="crisis-resources-card mt-5">
+            <div class="crisis-resources-header text-center">
+                <i class="fas fa-phone-alt me-2"></i> National Crisis Resources
+            </div>
+            {% if crisis_resources %}
+                {% set lines = crisis_resources.content.split('\n') %}
+                {% for line in lines %}
+                    <div class="crisis-resource-line">
+                        <i class="fas fa-phone-alt crisis-resource-icon"></i>
+                        {{ line|safe }}
+                    </div>
+                {% endfor %}
+            {% else %}
+                <div class="crisis-resource-line">
+                    <i class="fas fa-phone-alt crisis-resource-icon"></i>
+                    988 Suicide & Crisis Lifeline: Dial or text 988
+                </div>
+                <div class="crisis-resource-line">
+                    <i class="fas fa-phone-alt crisis-resource-icon"></i>
+                    Veterans Crisis Line: Call 988 and press "1"
+                </div>
+            {% endif %}
+            
+            <div class="crisis-resources-header text-center">
+                <i class="fas fa-map-marker-alt me-2"></i> Local Crisis Resources
+            </div>
+            {% if local_crisis_resources %}
+                {% for resource in local_crisis_resources %}
+                    <div class="crisis-resource-line">
+                        <i class="fas fa-phone-alt crisis-resource-icon"></i>
+                        {{ resource.name }}: {{ resource.description }}
+                    </div>
+                {% endfor %}
+            {% else %}
+                <div class="crisis-resource-line">
+                    <i class="fas fa-map-marker-alt crisis-resource-icon"></i>
+                    No local crisis resources found.
+                    <a href="{{ url_for('routes.support_network') }}" class="text-primary">
+                        Help us map local support resources!
+                    </a>
+                </div>
+            {% endif %}
+        </div>
+        
+        <footer>
+            <div class="container">
+                <div class="footer-links">
+                    <a href="{{ url_for('routes.about') }}" class="footer-link">About Us</a>
+                    <a href="{{ url_for('routes.crisis_resources') }}" class="footer-link">Resources</a>
+                    <a href="#" class="footer-link">Privacy Policy</a>
+                    <a href="#" class="footer-link">Contact</a>
+                </div>
+                <p class="copyright">© 2025 SIX - Supporting PTSD Recovery. All rights reserved.</p>
+            </div>
+        </footer>
+    </div>
+</div>
+{% endblock %}
+
+# File: templates/support_network.html
+{% extends "base.html" %}
+{% block title %}Support Network{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <div class="row mb-3">
+        {% if session.user and session.user.userType in ['survivor_of_ptsd', 'family_of_survivor'] %}
+        <div class="col-12 text-center">
+            <div class="d-grid gap-3 d-sm-flex justify-content-sm-center mb-4">
+                <button type="button" class="btn btn-primary btn-lg px-4 gap-3 shadow-sm" 
+                        data-bs-toggle="modal" data-bs-target="#gotYourSixModal">
+                    <i class="fas fa-hand-holding-heart me-2"></i>Got Your Six
+                </button>
+                <button type="button" class="btn btn-success btn-lg px-4 shadow-sm" 
+                        data-bs-toggle="modal" data-bs-target="#needSupportModal">
+                    <i class="fas fa-hands-helping me-2"></i>Need Support
+                </button>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+
+    <div class="chatter-profile mb-4">
+        <div class="profile-picture-container">
+            <img id="chatter-profile-picture" 
+                 src="{{ url_for('routes.get_profile_picture', file_id=session.user.profile_picture_id) if session.user.profile_picture_id else url_for('static', filename='default_avatar.png') }}" 
+                 alt="Profile Picture" 
+                 class="profile-picture-preview">
+            <div class="camera-icon" onclick="showChatProfileUpload()">
+                <i class="fas fa-camera"></i>
+            </div>
+        </div>
+        <div id="chatter-profile-picture-upload" class="profile-picture-upload" style="display:none;">
+            <input type="file" id="chatter-profile-picture-input" name="profile_picture" 
+                   accept=".jpg,.jpeg,.png,.webp" style="display:none;">
+            <div id="chatter-upload-text">
+                <p>Drag and drop your profile picture here</p>
+                <p>or</p>
+                <button type="button" class="btn btn-primary" onclick="document.getElementById('chatter-profile-picture-input').click()">
+                    Browse Files
+                </button>
+            </div>
+        </div>
+        <div class="profile-inputs">
+            <p id="default-fullName" class="text-muted" style="display:block;">
+                {{ session.user.fullName or 'Anonymous ' + session.user.userType.replace('_', ' ').title() }}
+            </p>
+            <input class="profile-input fullName-input" 
+                   type="text" 
+                   placeholder="Username" 
+                   maxlength="30" 
+                   value="{{ session.user.fullName or '' }}"
+                   style="display:none;"
+                   required>
+            
+            <p id="default-about-me" class="text-muted" style="display:block;">
+                In 200 characters or less, give a brief description of anything you have to say
+            </p>
+            <textarea class="profile-input about-me-input" 
+                      placeholder="About me (max 200 characters)" 
+                      maxlength="200"
+                      style="display:none;">{{ session.user.chatter_profile.chatter_about_me or '' }}</textarea>
+            
+            <input class="profile-input zip-code-input" 
+                   type="text" 
+                   placeholder="Zip Code" 
+                   value="{{ session.user.chatter_profile.chatter_zip_code or '' }}" 
+                   style="display:none;"
+                   required>
+            
+            <button id="create-chatter-profile-btn" class="btn btn-primary">Create Chat Profile</button>
+            
+            <div id="save-profile-section" style="display:none;">
+                <button class="btn btn-primary save-profile-btn">Save</button>
+                <div class="form-check mt-2">
+                    <input type="checkbox" class="form-check-input" id="remember-profile">
+                    <label class="form-check-label" for="remember-profile">Remember Me</label>
+                </div>
+            </div>
+            
+            <button class="btn btn-primary edit-profile-btn" style="display:none;">Edit Chat Profile</button>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-12">
+            <h1 class="text-center mb-4">Support Network</h1>
+            
+            <div class="section-banner chatter-section">
+                <i class="fas fa-comments section-icon"></i>
+                <h3>Support Chat</h3>
+            </div>
+
+            {% if session.user and (session.user.userType == 'survivor_of_ptsd' or session.user.userType == 'family_of_survivor') %}
+                <div id="local-chatter" class="chat-window" data-chat-type="local">
+                    <div class="chatter-header">{{ session.user.userType|title|replace('_', ' ') }} Local Support Chat</div>
+                    <div class="chatter-messages"></div>
+                    <div class="chatter-input">
+                        <input type="text" placeholder="Type your message..." data-user-type="{{ session.user.userType }}">
+                        <button class="emoji-picker">😊</button>
+                        <button class="send-btn" onclick="sendMessage('local')">Send</button>
+                    </div>
+                </div>
+                
+                <div id="national-chatter" class="chat-window" data-chat-type="national">
+                    <div class="chatter-header">{{ session.user.userType|title|replace('_', ' ') }} National Support Chat</div>
+                    <div class="chatter-messages"></div>
+                    <div class="chatter-input">
+                        <input type="text" placeholder="Type your message..." data-user-type="{{ session.user.userType }}">
+                        <button class="emoji-picker">😊</button>
+                        <button class="send-btn" onclick="sendMessage('national')">Send</button>
+                    </div>
+                </div>
+            {% endif %}
+            
+            <div class="section-banner maps-section">
+                <i class="fas fa-map-marker-alt section-icon"></i>
+                <h3>Support Maps</h3>
+            </div>
+            
+            <div id="support-map" style="height: 400px; margin-bottom: 2rem;"></div>
+            <button class="btn btn-primary mb-3" id="refresh-resources">
+                <i class="fas fa-sync-alt"></i> Refresh Local Resources
+            </button>
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">Suggest Support Resource</h5>
+                </div>
+                <div class="card-body">
+                    <form id="suggest-resource-form">
+                        <div class="mb-3">
+                            <label for="resource-name" class="form-label">Resource Name</label>
+                            <input type="text" class="form-control" id="resource-name" name="name" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="resource-description" class="form-label">Description</label>
+                            <textarea class="form-control" id="resource-description" name="description" rows="3" required></textarea>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Location (Click on map to set)</label>
+                            <div class="row">
+                                <div class="col">
+                                    <input type="number" class="form-control" id="resource-latitude" name="latitude" step="any" readonly required>
+                                </div>
+                                <div class="col">
+                                    <input type="number" class="form-control" id="resource-longitude" name="longitude" step="any" readonly required>
+                                </div>
+                            </div>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Suggest Resource</button>
+                    </form>
+                </div>
+            </div>
+      
+            <div class="section-banner events-section">
+                <i class="fas fa-calendar-alt section-icon"></i>
+                <h3>Event Maps</h3>
+            </div>
+            
+            <div id="event-map" style="height: 400px; margin-bottom: 2rem;"></div>
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">Suggest Event</h5>
+                </div>
+                <div class="card-body">
+                    <form id="suggest-event-form">
+                       <div class="mb-3">
+                            <label for="event-title" class="form-label">Event Title</label>
+                            <input type="text" class="form-control" id="event-title" name="title" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="event-description" class="form-label">Description</label>
+                            <textarea class="form-control" id="event-description" name="description" rows="3" required></textarea>
+                        </div>
+                        <div class="mb-3">
+                            <label for="event-date" class="form-label">Date & Time</label>
+                            <input type="datetime-local" class="form-control" id="event-date" name="date" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="event-location" class="form-label">Location</label>
+                            <input type="text" class="form-control" id="event-location" name="location" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Map Location (Click on map to set)</label>
+                            <div class="row">
+                                <div class="col">
+                                    <input type="number" class="form-control" id="event-latitude" name="latitude" step="any" readonly required>
+                                </div>
+                                <div class="col">
+                                    <input type="number" class="form-control" id="event-longitude" name="longitude" step="any" readonly required>
+                                </div>
+                            </div>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Suggest Event</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="{{ url_for('static', filename='got_your_six.js') }}"></script>
+<script src="https://maps.googleapis.com/maps/api/js?key={{ google_maps_api_key }}&libraries=places"></script>
+<script src="{{ url_for('static', filename='support_network.js') }}"></script>
+<script>
+    const currentUserUsername = "{{ session.user.chatter_profile.chatter_username if session.user and session.user.chatter_profile else 'Guest' }}";
+</script>
+{% endblock %}
+
+# File: templates/crisis_resources.html
+{% extends "base.html" %}
+{% block title %}Crisis Resources{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-12">
+            <h1 class="text-center mb-4">Crisis Resources</h1>
+            <img src="{{ url_for('static', filename='logo.png') }}" alt="SIX Logo" class="header-logo mb-4 d-block mx-auto">
+            
+            <div class="card mb-4 crisis-resources-card">
+                <div class="card-header crisis-resources-header">
+                    <h5 class="mb-0 text-uppercase">
+                        <i class="fas fa-medical-cross me-2"></i>
+                        EMERGENCY CRISIS SUPPORT
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <p class="crisis-resource-line">
+                        <i class="fas fa-phone-alt crisis-resource-icon"></i>
+                        If you are in immediate danger, call 911.
+                    </p>
+                </div>
+                
+                <div class="card-header crisis-resources-header">
+                    <h5 class="mb-0 text-uppercase">
+                        <i class="fas fa-phone-alt me-2"></i>
+                        NATIONAL CRISIS SUPPORT
+                    </h5>
+                </div>
+                <div class="card-body">
+                    {% if crisis_resources %}
+                        {% set lines = crisis_resources.content.split('\n') %}
+                        {% for line in lines %}
+                            <p class="crisis-resource-line">
+                                <i class="fas fa-phone-alt crisis-resource-icon"></i>
+                                {{ line|safe }}
+                            </p>
+                        {% endfor %}
+                    {% else %}
+                        <p class="crisis-resource-line">
+                            <i class="fas fa-phone-alt crisis-resource-icon"></i>
+                            988 Suicide & Crisis Lifeline: Dial or text 988, 24/7 service. <a href="https://988lifeline.org" target="_blank">Visit Site</a>
+                        </p>
+                        <p class="crisis-resource-line">
+                            <i class="fas fa-phone-alt crisis-resource-icon"></i>
+                            Veterans Crisis Line: Call 988 and press "1". Text 838255. <a href="https://www.veteranscrisisline.net" target="_blank">Visit Site</a>
+                        </p>
+                        <p class="crisis-resource-line">
+                            <i class="fas fa-phone-alt crisis-resource-icon"></i>
+                            Crisis Text Line: Text HOME to 741-741 for free, 24/7 crisis support. <a href="https://www.crisistextline.org" target="_blank">Visit Site</a>
+                        </p>
+                        <p class="crisis-resource-line">
+                            <i class="fas fa-phone-alt crisis-resource-icon"></i>
+                            National Domestic Violence Hotline: Call 800-799-SAFE (7233). <a href="https://www.thehotline.org" target="_blank">Visit Site</a>
+                        </p>
+                    {% endif %}
+                </div>
+                
+                <div class="card-header crisis-resources-header">
+                    <h5 class="mb-0 text-uppercase">
+                        <i class="fas fa-map-marker-alt me-2"></i>
+                        LOCAL CRISIS SUPPORT
+                    </h5>
+                </div>
+                <div class="card-body">
+                    {% if local_resources %}
+                        {% for resource in local_resources %}
+                            <p class="crisis-resource-line">
+                                <i class="fas fa-map-marker-alt crisis-resource-icon"></i>
+                                {{ resource.name }}: {{ resource.description }}
+                            </p>
+                        {% endfor %}
+                    {% else %}
+                        <div class="crisis-resource-line">
+                            <i class="fas fa-map-marker-alt crisis-resource-icon"></i>
+                            No local crisis resources found within 40 miles of your location.
+                            <a href="{{ url_for('routes.support_network') }}" class="text-primary">
+                                Help us map local support resources!
+                            </a>
+                        </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+# File: templates/ptsd_info.html
+{% extends "base.html" %}
+{% block title %}Understanding PTSD{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-12">
+            <h1 class="text-center mb-4">Understanding PTSD</h1>
+            <img src="{{ url_for('static', filename='logo.png') }}" alt="SIX Logo" class="header-logo mb-4 d-block mx-auto">
+            
+            {% if session.user and session.user.userType == 'survivor_of_ptsd' %}
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">Introduction for Survivors</h5>
+                    </div>
+                    <div class="card-body">
+                        <p>Welcome to your Growth Resources page on Understanding PTSD, crafted just for you—someone who's lived through trauma and is navigating post-traumatic stress disorder. PTSD can feel like a heavy shadow, with symptoms like flashbacks, anxiety, or a constant sense of danger disrupting your life. It's not a sign of weakness; it's a natural response to unnatural events. Here, we've gathered articles to help you understand what PTSD is, how it shows up, why it happens, and what you can do about it. Whether you're looking for clarity on your experiences, treatment options, or ways to cope day-to-day, this page is your starting point. We've also included special topics that might hit close to home, like sleep struggles or work challenges. You're not alone in this—millions share this path, and healing is possible. Take your time exploring the sections below, and let this knowledge empower you to take small, meaningful steps forward.</p>
+                    </div>
+                </div>
+
+                <div class="card mt-4">
+                    <div class="card-header">
+                        <h5 class="mb-0">Recommended Articles for Survivors</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>What is PTSD? A Survivor's Starting Point</h6>
+                                        <p>This Mayo Clinic article offers a clear, compassionate overview of PTSD, defining it as a mental health condition triggered by terrifying events you've experienced or witnessed. It explains how PTSD differs from normal stress, emphasizing symptoms like intrusive memories or emotional numbness that might feel all too familiar.</p>
+                                        <a href="https://www.mayoclinic.org/diseases-conditions/post-traumatic-stress-disorder/symptoms-causes/syc-20355967" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Symptoms of PTSD: What You're Feeling</h6>
+                                        <p>From the NIMH, this article dives into the four core PTSD symptom groups: re-experiencing (like nightmares), avoidance (steering clear of reminders), negative mood changes (feeling detached), and hyperarousal (being jumpy). It explains how these can disrupt your sleep, focus, or sense of safety.</p>
+                                        <a href="https://www.nimh.nih.gov/health/topics/post-traumatic-stress-disorder-ptsd" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Causes of PTSD: Why Me?</h6>
+                                        <p>The APA's article explores why PTSD develops after trauma—like assaults or disasters. It details how intense fear or helplessness can rewire your brain, making it hard to move on. Beyond the event, it covers personal factors that might make you more vulnerable.</p>
+                                        <a href="https://www.psychiatry.org/patients-families/ptsd/what-is-ptsd" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Treatments for PTSD: Paths to Healing</h6>
+                                        <p>This ADAA piece outlines proven treatments like Cognitive Behavioral Therapy (CBT) and Eye Movement Desensitization and Reprocessing (EMDR). It explains what to expect—like gradual progress, not instant fixes—and how these can reduce the grip of PTSD.</p>
+                                        <a href="https://adaa.org/understanding-anxiety/posttraumatic-stress-disorder-ptsd/treatment" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Coping with PTSD: Tools for Today</h6>
+                                        <p>HelpGuide's article offers hands-on coping strategies—like deep breathing to calm panic or grounding techniques to stay present during triggers. It suggests small habits to build resilience without overwhelming you.</p>
+                                        <a href="https://www.helpguide.org/articles/ptsd-trauma/coping-with-ptsd.htm" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            {% elif session.user and session.user.userType == 'family_of_survivor' %}
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">Introduction for Family Members</h5>
+                    </div>
+                    <div class="card-body">
+                        <p>Welcome to your Growth Resources page on Understanding PTSD, designed for family members and friends of survivors. When someone you love has post-traumatic stress disorder, it's not just their struggle—it touches your life too. You might see them pull away, lash out, or wrestle with memories they can't shake, leaving you unsure how to help or cope. This page is here to guide you through what PTSD is, its symptoms, causes, treatments, and ways to support them (and yourself).</p>
+                    </div>
+                </div>
+
+                <div class="card mt-4">
+                    <div class="card-header">
+                        <h5 class="mb-0">Recommended Articles for Family Members</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>What is PTSD? Seeing It Through Their Eyes</h6>
+                                        <p>This VA article introduces PTSD as a disorder rooted in trauma, explaining its impact on your loved one's mind and behavior. It covers how events like combat or accidents can trigger lasting fear, helping you see their withdrawal or irritability as symptoms, not rejection.</p>
+                                        <a href="https://www.ptsd.va.gov/understand/what/index.asp" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Symptoms of PTSD: What You're Noticing</h6>
+                                        <p>Verywell Mind's piece details how PTSD symptoms—like avoidance or hypervigilance—play out in daily life, affecting your loved one's routines and your interactions. It uses examples to show how trauma lingers.</p>
+                                        <a href="https://www.verywellmind.com/how-ptsd-can-affect-everyday-life-2797210" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Causes of PTSD: Why It Happened</h6>
+                                        <p>The VA's National Center for PTSD examines why some develop PTSD after trauma while others don't, pointing to factors like prior stress or weak support systems. It helps you see your loved one's condition as a mix of event and circumstance.</p>
+                                        <a href="https://www.ptsd.va.gov/understand/common/common_causes.asp" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Treatments for PTSD: Supporting Recovery</h6>
+                                        <p>WebMD's article reviews treatments like therapy and medications, explaining how they lessen PTSD's hold. It offers ways to encourage help-seeking while respecting their pace.</p>
+                                        <a href="https://www.webmd.com/mental-health/what-are-treatments-for-posttraumatic-stress-disorder" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Coping with PTSD: Helping Them, Helping You</h6>
+                                        <p>NAMI's piece provides family-focused advice—like listening without fixing or setting boundaries to avoid burnout. It balances supporting your loved one with self-care.</p>
+                                        <a href="https://www.nami.org/about-mental-illness/mental-health-conditions/posttraumatic-stress-disorder/support/" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            {% elif session.user and session.user.userType == 'medical_professional' %}
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">Introduction for Medical Professionals</h5>
+                    </div>
+                    <div class="card-body">
+                        <p>Welcome to your Growth Resources page on Understanding PTSD, tailored for medical professionals like you—therapists, doctors, and nurses who diagnose and treat post-traumatic stress disorder. PTSD is a multifaceted condition, born from trauma and expressed through symptoms like intrusive thoughts or hyperarousal, impacting patients' lives deeply. Your expertise is their lifeline, whether you're identifying causes, prescribing treatments, or teaching coping skills.</p>
+                    </div>
+                </div>
+
+                <div class="card mt-4">
+                    <div class="card-header">
+                        <h5 class="mb-0">Recommended Articles for Medical Professionals</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>What is PTSD? A Clinical Overview</h6>
+                                        <p>NIMH's article provides a rigorous overview of PTSD, aligning with DSM-5 criteria and detailing its prevalence across populations. It covers how trauma disrupts normal stress responses, offering a scientific base for diagnosis.</p>
+                                        <a href="https://www.nimh.nih.gov/health/topics/post-traumatic-stress-disorder-ptsd" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Symptoms of PTSD: Diagnostic Signs</h6>
+                                        <p>The APA's guideline breaks down PTSD's symptom clusters—intrusion, avoidance, negative cognition, arousal—with clinical examples and assessment tips. It's a detailed tool for professionals to spot subtle presentations.</p>
+                                        <a href="https://www.apa.org/ptsd-guideline" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Causes of PTSD: Trauma and Risk Factors</h6>
+                                        <p>This VA article focuses on trauma types and risk factors, providing data on why PTSD emerges. For clinicians, it's a deep dive into etiology, useful for tailoring patient histories and treatment plans.</p>
+                                        <a href="https://www.ptsd.va.gov/understand/common/common_veterans.asp" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Treatments for PTSD: Evidence-Based Options</h6>
+                                        <p>GoodTherapy reviews therapies like CBT and EMDR, plus medications, with evidence on outcomes and patient suitability. It's a practical guide to match interventions to symptoms.</p>
+                                        <a href="https://www.goodtherapy.org/blog/how-to-find-a-therapist-for-ptsd-0913184" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="card h-100">
+                                    <div class="card-body">
+                                        <h6>Coping with PTSD: Patient Strategies</h6>
+                                        <p>ADAA's article highlights coping tools—like exposure techniques or relaxation training—that clinicians can teach patients. It blends theory with application, giving actionable ways to boost | patient resilience.</p>
+                                        <a href="https://adaa.org/understanding-anxiety/posttraumatic-stress-disorder-ptsd/treatment" target="_blank" class="btn btn-primary">Read Article</a>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            {% else %}
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">Select User Type to Personalize Content</h5>
+                    </div>
+                    <div class="card-body">
+                        <p>Please update your profile to see personalized PTSD resources.</p>
+                        <a href="{{ url_for('routes.profile') }}" class="btn btn-primary">Update Profile</a>
+                    </div>
+                </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+# File: templates/about.html
+{% extends "base.html" %}
+{% block title %}About SIX{% endblock %}
+{% block content %}
+<div class="main-content">
+    <div class="container mt-4">
+        <div class="row">
+            <div class="col-12">
+                <h1 class="text-center mb-4">About SIX</h1>
+                <img src="{{ url_for('static', filename='logo.png') }}" alt="SIX Logo" class="header-logo mb-4 d-block mx-auto">
+                
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h5 class="mb-0">Business Philosophy: Transforming Lives Through Cutting-Edge Innovation</h5>
+                    </div>
+                    <div class="card-body">
+                        <p>Be the leader in cutting edge technology that will improve the quality of life for individuals affected by PTSD.</p>
+                        <p>At the heart of our mission lies a steadfast commitment to leveraging cutting-edge technology to improve the quality of life for individuals affected by PTSD.</p>
+                    </div>
+                </div>
+                
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h5 class="mb-0">Our Team</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="team-member mb-4">
+                            <div class="row">
+                                <div class="col-md-3">
+                                    <img src="{{ url_for('static', filename='chad_smith.png') }}" alt="Chad M. Smith" class="img-fluid rounded-circle mb-3">
+                                </div>
+                                <div class="col-md-9">
+                                    <h6>Chad M. Smith - PTSD Diagnostic and Treatment Device Lead</h6>
+                                    <p>Chad M. Smith, now based in Louisiana, draws from a rich tapestry of experiences that uniquely qualify him to spearhead the development of a groundbreaking device for PTSD diagnosis and treatment.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h5 class="mb-0">Our Mission</h5>
+                    </div>
+                    <div class="card-body">
+                        <p>SIX is a compassionate, community-driven platform dedicated to supporting individuals affected by Post-Traumatic Stress Disorder (PTSD).</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+# File: templates/profile.html
+{% extends "base.html" %}
+{% block title %}Your Profile{% endblock %}
+{% block content %}
+<div class="container mt-5">
+    <div class="row">
+        <div class="col-md-8 offset-md-2">
+            <div class="profile-details">
+                <h2>Profile Information</h2>
+                <form id="profile-form" method="POST" enctype="multipart/form-data">
+                    <div class="mb-3">
+                        <label for="email" class="form-label">Email</label>
+                        <p class="form-control-static">{{ session.user.email }}</p>
+                    </div>
+                    
+                    <div class="mb-3 position-relative">
+                        <div class="profile-picture-container">
+                            <img id="profile-picture-preview" class="profile-picture-preview" 
+                                 src="{% if session.user.profile_picture_id %}{{ url_for('routes.get_profile_picture', file_id=session.user.profile_picture_id) }}{% else %}{{ url_for('static', filename='default_avatar.png') }}{% endif %}"
+                                 style="display: {{ 'block' if session.user.profile_picture_id else 'none' }};">
+                            <button type="button" class="camera-icon" onclick="showUploadDialog()">
+                                <i class="fas fa-camera"></i>
+                            </button>
+                        </div>
+                        <div id="profile-picture-upload" class="profile-picture-upload" style="display:none;">
+                            <input type="file" id="profile-picture-input" name="profile_picture" 
+                                   accept=".jpg,.jpeg,.png,.webp" style="display:none;">
+                            <div id="upload-text">
+                                <p>Drag and drop your profile picture here</p>
+                                <p>or</p>
+                                <button type="button" class="btn btn-primary" onclick="document.getElementById('profile-picture-input').click()">
+                                    Browse Files
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">User Type</label>
+                        <p class="form-control-static">{{ session.user.userType }}</p>
+                        <select class="form-control" id="userType" name="userType" style="display:none;">
+                            <option value="survivor_of_ptsd" {% if session.user.userType == 'survivor_of_ptsd' %}selected{% endif %}>Survivor of PTSD</option>
+                            <option value="family_of_survivor" {% if session.user.userType == 'family_of_survivor' %}selected{% endif %}>Family of Survivor</option>
+                            <option value="medical_professional" {% if session.user.userType == 'medical_professional' %}selected{% endif %}>Medical Professional</option>
+                            <option value="browsing" {% if session.user.userType == 'browsing' %}selected{% endif %}>Just Browsing</option>
+                            <option value="admin" {% if session.user.userType == 'admin' %}selected{% endif %}>Administrator</option>
+                        </select>
+                        {% if session.user.userType == 'medical_professional' %}
+                        <div class="professional-details">
+                            <div class="alert alert-info">
+                                <strong>Professional Verification Status:</strong> 
+                                {% if session.user.professional_verification_status %}
+                                    <span class="badge bg-success">Verified</span>
+                                {% else %}
+                                    <span class="badge bg-warning">Pending Verification</span>
+                                {% endif %}
+                            </div>
+                            <label for="professional_credentials" class="form-label">Professional Credentials</label>
+                            <p class="form-control-static">{{ session.user.professional_credentials }}</p>
+                            <input type="text" class="form-control" id="professional_credentials" name="professional_credentials" value="{{ session.user.professional_credentials }}" style="display:none;" required>
+                            <label for="professional_license_number" class="form-label">License Number</label>
+                            <p class="form-control-static">{{ session.user.professional_license_number }}</p>
+                            <input type="text" class="form-control" id="professional_license_number" name="professional_license_number" value="{{ session.user.professional_license_number }}" style="display:none;" required>
+                        </div>
+                        {% endif %}
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">Zip Code</label>
+                        <p class="form-control-static">{{ session.user.chatter_profile.chatter_zip_code }}</p>
+                        <input type="text" class="form-control" id="zip_code" name="zip_code" 
+                               value="{{ session.user.chatter_profile.chatter_zip_code if session.user.chatter_profile.chatter_zip_code }}" placeholder="Enter your zip code"
+                               style="display:none;">
+                    </div>
+                    
+                    <button type="button" class="btn btn-primary" id="make-changes-btn">Make Changes</button>
+                    <button type="submit" class="btn btn-primary" id="save-profile" style="display:none;">Save Changes</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const dropZone = document.getElementById('profile-picture-upload');
+        const fileInput = document.getElementById('profile-picture-input');
+        const uploadText = document.getElementById('upload-text');
+        const profilePicturePreview = document.getElementById('profile-picture-preview');
+        const makeChangesBtn = document.getElementById('make-changes-btn');
+        const saveProfileBtn = document.getElementById('save-profile');
+        
+        function showUploadDialog() {
+            dropZone.style.display = 'block';
+        }
+        
+        if (makeChangesBtn) {
+            makeChangesBtn.addEventListener('click', function() {
+                const userTypeField = document.getElementById('userType');
+                const zipCodeField = document.getElementById('zip_code');
+                const credentialsField = document.getElementById('professional_credentials');
+                const licenseField = document.getElementById('professional_license_number');
+                
+                if (userTypeField) userTypeField.style.display = 'block';
+                if (zipCodeField) zipCodeField.style.display = 'block';
+                if (credentialsField) credentialsField.style.display = 'block';
+                if (licenseField) licenseField.style.display = 'block';
+                if (saveProfileBtn) saveProfileBtn.style.display = 'block';
+                makeChangesBtn.style.display = 'none';
+                
+                document.querySelectorAll('.form-control-static').forEach(el => {
+                    el.style.display = 'none';
+                });
+            });
+        }
+        
+        saveProfileBtn.addEventListener('click', function(event) {
+            event.preventDefault();
+            document.getElementById('userType').style.display = 'none';
+            document.getElementById('zip_code').style.display = 'none';
+            saveProfileBtn.style.display = 'none';
+            makeChangesBtn.style.display = 'block';
+            
+            document.querySelectorAll('.form-control-static').forEach(el => {
+                el.style.display = 'block';
+            });
+            
+            document.getElementById('profile-form').submit();
+        });
+    });
+</script>
+{% endblock %}
+
+# File: templates/login.html
+{% extends "base.html" %}
+{% block title %}Login/Register{% endblock %}
+{% block content %}
+<div class="container">
+    <div class="login-container">
+        <h2 class="text-center mb-4">Login / Register</h2>
+        
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+                        {{ message }}
+                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        
+        <form id="login-form" method="POST" action="{{ url_for('routes.login') }}" autocomplete="on">
+            <div class="mb-3">
+                <label for="email" class="form-label">Email address</label>
+                <input type="email" class="form-control" id="email" name="email" required autocomplete="email">
+            </div>
+            <div class="mb-3">
+                <label for="password" class="form-label">Password</label>
+                <div class="input-group">
+                    <input type="password" class="form-control" id="password" name="password" required autocomplete="current-password">
+                    <button class="btn btn-outline-secondary" type="button" onclick="togglePasswordVisibility('password')">
+                        <i class="fas fa-eye" id="password-toggle-icon"></i>
+                    </button>
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Login</button>
+        </form>
+        <p class="text-center mt-2"><a href="{{ url_for('routes.forgot_password') }}">Forgot Password?</a></p>
+        <div class="text-center mt-3">
+            <p>Don't have an account? <a href="#" id="show-register">Register here</a></p>
+        </div>
+        
+        <form id="register-form" method="POST" action="{{ url_for('routes.register') }}" style="display: none;" autocomplete="on">
+            <div class="mb-3">
+                <label for="register-email" class="form-label">Email address</label>
+                <input type="email" class="form-control" id="register-email" name="email" required autocomplete="email">
+                <small class="form-text text-muted">We'll never share your email with anyone else.</small>
+            </div>
+            <div class="mb-3">
+                <label for="register-password" class="form-label">Password</label>
+                <div class="input-group">
+                    <input type="password" class="form-control" id="register-password" name="password" required 
+                           pattern="^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$"
+                           autocomplete="new-password">
+                    <button class="btn btn-outline-secondary" type="button" onclick="togglePasswordVisibility('register-password')">
+                        <i class="fas fa-eye" id="register-password-toggle-icon"></i>
+                    </button>
+                </div>
+                <small class="form-text text-muted">Password must be at least 8 characters long and include uppercase, lowercase, numbers and special characters.</small>
+            </div>
+            <div class
